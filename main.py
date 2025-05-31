@@ -29,7 +29,7 @@ class DifficultyWindow(QMainWindow):
         
     def initUI(self):
         self.setWindowTitle('DJMAX RESPECT V 업다운 순회')
-        self.setGeometry(100, 100, 500, 350)  # 더 높게 조정해서 새 버튼을 위한 공간 확보
+        self.setGeometry(100, 100, 500, 320)  # 높이를 조금 줄임 (버튼 제거로 인해)
         
         # 중앙 위젯 설정
         central = QWidget()
@@ -69,11 +69,6 @@ class DifficultyWindow(QMainWindow):
             
         level_layout.addWidget(self.level_combo)
         layout.addLayout(level_layout)
-        
-        # 곡 데이터 업데이트 버튼 추가
-        self.update_songs_btn = QPushButton('곡 데이터 업데이트')
-        self.update_songs_btn.clicked.connect(self.onUpdateSongs)
-        layout.addWidget(self.update_songs_btn)
         
         # 시작 버튼
         self.start_btn = QPushButton('시작')
@@ -144,13 +139,9 @@ class DifficultyWindow(QMainWindow):
         for mode, btn in self.mode_buttons.items():
             btn.toggled.connect(self.onModeChanged)
         
-    def onUpdateSongs(self):
-        """온라인에서 곡 데이터를 업데이트합니다."""
+    def updateSongsData(self):
+        """온라인에서 곡 데이터를 업데이트합니다. (메시지 없음)"""
         try:
-            self.update_songs_btn.setEnabled(False)
-            self.update_songs_btn.setText('업데이트 중...')
-            QApplication.processEvents()  # UI 업데이트
-            
             # 온라인에서 데이터 다운로드
             print("온라인에서 곡 데이터를 다운로드하는 중...")
             with urllib.request.urlopen(self.songs_url, timeout=30) as response:
@@ -158,7 +149,7 @@ class DifficultyWindow(QMainWindow):
             
             # 필요한 필드만 필터링
             filtered_data = []
-            excluded_fields = ["title", "composer", "dlcCode", "dlc", "rating"]
+            excluded_fields = ["title", "composer", "dlcCode", "dlc", "rating", "level"]
             
             for song in online_data:
                 filtered_song = {}
@@ -179,24 +170,17 @@ class DifficultyWindow(QMainWindow):
             self.songs_cache_time = 0
             
             print(f"곡 데이터 업데이트 완료: {len(filtered_data)}곡")
-            QMessageBox.information(self, '업데이트 완료', 
-                                  f'곡 데이터가 성공적으로 업데이트되었습니다.\n총 {len(filtered_data)}곡')
+            return True
             
         except urllib.error.URLError as e:
             print(f"네트워크 오류: {e}")
-            QMessageBox.warning(self, '업데이트 실패', 
-                              f'네트워크 연결을 확인해주세요.\n오류: {str(e)}')
+            return False
         except json.JSONDecodeError as e:
             print(f"JSON 파싱 오류: {e}")
-            QMessageBox.warning(self, '업데이트 실패', 
-                              f'데이터 형식 오류가 발생했습니다.\n오류: {str(e)}')
+            return False
         except Exception as e:
             print(f"업데이트 중 오류 발생: {e}")
-            QMessageBox.warning(self, '업데이트 실패', 
-                              f'업데이트 중 오류가 발생했습니다.\n오류: {str(e)}')
-        finally:
-            self.update_songs_btn.setEnabled(True)
-            self.update_songs_btn.setText('곡 데이터 업데이트')
+            return False
             
     def checkForAutoUpdate(self):
         """자동 업데이트 확인 (1시간마다)"""
@@ -210,12 +194,12 @@ class DifficultyWindow(QMainWindow):
                 # 로컬 파일이 없거나 24시간 이상 오래된 경우 자동 업데이트
                 if not os.path.exists(songs_path):
                     print("로컬 곡 데이터가 없어 자동 업데이트를 시도합니다.")
-                    self.onUpdateSongs()
+                    self.updateSongsData()
                 else:
                     file_age = current_time - os.path.getmtime(songs_path)
                     if file_age > 86400:  # 24시간 = 86400초
                         print("곡 데이터가 24시간 이상 오래되어 자동 업데이트를 시도합니다.")
-                        self.onUpdateSongs()
+                        self.updateSongsData()
             except Exception as e:
                 print(f"자동 업데이트 확인 중 오류: {e}")
                 
@@ -378,6 +362,21 @@ class DifficultyWindow(QMainWindow):
             self.level_combo.addItem(f"{level:.1f}")
             
     def onStart(self):
+        # 시작 버튼을 누를 때 곡 데이터 업데이트
+        self.start_btn.setEnabled(False)
+        self.start_btn.setText('데이터 업데이트 중...')
+        QApplication.processEvents()  # UI 업데이트
+        
+        # 곡 데이터 업데이트 시도
+        update_success = self.updateSongsData()
+        
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText('시작')
+        
+        if not update_success:
+            # 업데이트 실패 시 기존 로컬 데이터 사용
+            print("온라인 업데이트 실패, 기존 로컬 데이터 사용")
+        
         # 현재 난이도 설정
         self.current_level = float(self.level_combo.currentText())
         # 화면 업데이트 (저장된 진행도 유지)
@@ -417,7 +416,7 @@ class DifficultyWindow(QMainWindow):
                 songs_path = os.path.join(script_dir, 'songs.json')
                 
                 if not os.path.exists(songs_path):
-                    print("로컬 곡 데이터가 없습니다. '곡 데이터 업데이트' 버튼을 눌러주세요.")
+                    print("로컬 곡 데이터가 없습니다. 시작 버튼을 눌러주세요.")
                     return None
                 
                 with open(songs_path, 'r', encoding='utf-8') as f:
