@@ -240,14 +240,9 @@ class DifficultyWindow(QMainWindow):
             if os.path.exists(shown_path):
                 with open(shown_path, 'r', encoding='utf-8') as f:
                     shown_data = json.load(f)
-                    # JSON에서 로드한 데이터를 적절한 형식으로 변환
                     result = {}
                     for level_key, songs in shown_data.items():
-                        result[level_key] = set()
-                        for song in songs:
-                            # JSON에서는 튜플이 리스트로 저장되므로 다시 튜플로 변환
-                            if isinstance(song, list) and len(song) == 2:
-                                result[level_key].add(tuple(song))
+                        result[level_key] = set(tuple(song) for song in songs)
                     return result
             return {}
         except Exception as e:
@@ -310,14 +305,17 @@ class DifficultyWindow(QMainWindow):
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             shown_path = os.path.join(script_dir, 'shown_songs.json')
-            
+
             # set 타입은 JSON으로 직렬화할 수 없으므로 리스트로 변환
             shown_data = {}
             for level_key, songs in self.shown_songs.items():
                 shown_data[level_key] = [list(song) for song in songs]
-                
+
             with open(shown_path, 'w', encoding='utf-8') as f:
                 json.dump(shown_data, f, ensure_ascii=False, indent=2)
+
+            print(f"진행도 저장 완료: {len(shown_data)}개 난이도")
+
         except Exception as e:
             print(f"표시된 곡 저장 중 오류 발생: {e}")
             
