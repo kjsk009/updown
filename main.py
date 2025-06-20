@@ -149,13 +149,19 @@ class DifficultyWindow(QMainWindow):
             
             # 필요한 필드만 필터링
             filtered_data = []
-            excluded_fields = ["title", "composer", "dlcCode", "dlc", "rating", "level"]
+            excluded_fields = ["title", "composer", "dlcCode", "dlc"]
             
             for song in online_data:
                 filtered_song = {}
                 for key, value in song.items():
                     if key not in excluded_fields:
                         filtered_song[key] = value
+                # patterns 내부의 rating도 제거
+                if "patterns" in filtered_song:
+                    for mode in filtered_song["patterns"].values():
+                        for diff in mode.values():
+                            if isinstance(diff, dict) and "rating" in diff:
+                                del diff["rating"]
                 filtered_data.append(filtered_song)
             
             # 로컬 파일에 저장
@@ -454,8 +460,8 @@ class DifficultyWindow(QMainWindow):
                                 if song_key in self.cleared_songs:
                                     cleared_count += 1
                                 else:
-                                    # 클리어하지 않은 곡만 후보에 추가
-                                    matching_songs.append((song['name'], f"{diff_type}({info['floor']:.1f})", diff_type))
+                                    # 클리어하지 않은 곡만 후보에 추가 (level로 표기)
+                                    matching_songs.append((song['name'], f"{diff_type}({info.get('level', '?')})", diff_type, info.get('level', '?')))
             
             remaining_songs = total_songs - cleared_count  # 남은 곡 수 계산
             
@@ -499,8 +505,18 @@ class DifficultyWindow(QMainWindow):
                 self.clear_checkbox.setChecked(song_key in self.cleared_songs)
                 self.clear_checkbox.setEnabled(True)
                 
-                # 화면에 선택된 곡 표시
-                self.song_list.setText(f"⭐ {selected_song[0]} - {selected_song[1]}")
+                # 화면에 선택된 곡 표시 (색상 적용)
+                color_map = {
+                    "NM": "#FFD600",   # 노랑
+                    "HD": "#FF9800",   # 주황
+                    "MX": "#F44336",   # 빨강
+                    "SC": "#9C27B0"    # 보라
+                }
+                diff_type = selected_song[2]
+                color = color_map.get(diff_type, "#000000")
+                level = selected_song[3]
+                self.song_list.setTextFormat(Qt.RichText)
+                self.song_list.setText(f"⭐ {selected_song[0]} - <span style='color:{color}; font-weight:bold'>{diff_type}({level})</span>")
                 
             else:
                 if total_songs > 0:  # 곡이 있지만 모두 클리어한 경우
