@@ -15,7 +15,7 @@ except ImportError as e:
 class DifficultyWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.cleared_songs = self.loadClearedSongs()  # 클리어한 곡들을 불러옴
+        self.cleared_songs = self.loadClearedSongs()  # (구버전) 클리어한 곡들을 불러옴
         self.shown_songs = self.loadShownSongs()  # 각 난이도별로 이미 표시한 곡들을 저장
         self.songs_cache = None  # 곡 데이터 캐시
         self.songs_cache_time = 0  # 캐시 생성 시간
@@ -25,11 +25,16 @@ class DifficultyWindow(QMainWindow):
         self.update_check_interval = 3600  # 업데이트 확인 간격 (1시간)
         self.last_settings = self.loadLastSettings()  # 마지막 설정 불러오기
         self.current_candidates = []  # 현재 추천 후보곡 목록
+        self.failed_songs = {}  # 실패한 곡 추적 (난이도별)
+        self.result_stats = self.loadResultStats()  # 난이도별 성공/실패 집계
+        self.attempt_stats = self.loadAttemptStats()  # 곡+패턴별 시도 집계 (표시용 고유 통계)
+        self.cleanExistingDuplicates()  # 기존 중복 데이터 정리
+        self.migrateClearedToAttemptStats()  # 구버전 클리어 정보를 attempt_stats로 이전
         self.initUI()
         
     def initUI(self):
         self.setWindowTitle('DJMAX RESPECT V 업다운 순회')
-        self.setGeometry(100, 100, 500, 320)  # 높이를 조금 줄임 (버튼 제거로 인해)
+        self.setGeometry(100, 100, 500, 400)  # 높이를 늘려서 새로운 UI 요소들 수용
         
         # 중앙 위젯 설정
         central = QWidget()
@@ -84,11 +89,30 @@ class DifficultyWindow(QMainWindow):
         self.progress_label = QLabel('진행도: -/-')
         self.progress_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.progress_label)
+        # 성공/실패 통계 표시
+        self.sf_label = QLabel('')
+        self.sf_label.setAlignment(Qt.AlignCenter)
+        self.sf_label.setTextFormat(Qt.RichText)
+        self.sf_label.setText("<b><span style='color:#2e7d32'>성공: 0</span></b> / <b><span style='color:#d32f2f'>실패: 0</span></b>")
+        layout.addWidget(self.sf_label)
         
-        # 진행도 초기화 버튼 추가
-        self.reset_progress_btn = QPushButton('진행도 초기화')
-        self.reset_progress_btn.clicked.connect(self.onResetProgress)
-        layout.addWidget(self.reset_progress_btn)
+        # 실패한 난이도 표시
+        self.failed_levels_label = QLabel('')
+        self.failed_levels_label.setAlignment(Qt.AlignCenter)
+        self.failed_levels_label.setTextFormat(Qt.RichText)
+        self.failed_levels_label.setStyleSheet("color: #d32f2f; font-weight: bold;")
+        layout.addWidget(self.failed_levels_label)
+        
+        # 진행도 초기화 버튼들 추가
+        reset_btn_layout = QHBoxLayout()
+        self.reset_current_btn = QPushButton('현재 난이도 초기화')
+        self.reset_all_btn = QPushButton('전체 모드 초기화')
+        self.reset_current_btn.clicked.connect(self.onResetCurrentLevel)
+        self.reset_all_btn.clicked.connect(self.onResetAllLevels)
+        reset_btn_layout.addWidget(self.reset_current_btn)
+        reset_btn_layout.addWidget(self.reset_all_btn)
+        layout.addLayout(reset_btn_layout)
+        
         
         # 성공/실패 버튼
         btn_layout = QHBoxLayout()
@@ -139,6 +163,7 @@ class DifficultyWindow(QMainWindow):
         for mode, btn in self.mode_buttons.items():
             btn.toggled.connect(self.onModeChanged)
         
+        
     def updateSongsData(self):
         """온라인에서 곡 데이터를 업데이트합니다. (메시지 없음)"""
         try:
@@ -149,7 +174,7 @@ class DifficultyWindow(QMainWindow):
             
             # 필요한 필드만 필터링
             filtered_data = []
-            excluded_fields = ["title", "composer", "dlcCode", "dlc"]
+            excluded_fields = ["title", "dlcCode", "dlc"]
             
             for song in online_data:
                 filtered_song = {}
@@ -211,23 +236,78 @@ class DifficultyWindow(QMainWindow):
                 
     def onModeChanged(self):
         """모드가 변경될 때 해당 모드의 마지막 난이도로 콤보박스를 업데이트합니다."""
-        if self.sender().isChecked():  # 선택된 라디오 버튼만 처리
-            current_mode = self.getSelectedMode()
-            last_level = self.last_settings.get(current_mode, 8.1)
+        try:
+            # 선택된 라디오 버튼만 처리
+            sender = self.sender()
+            if sender and sender.isChecked():
+                current_mode = self.getSelectedMode()
+                last_level = self.last_settings.get(current_mode, 8.1)
+                
+                # 콤보박스를 해당 모드의 마지막 난이도로 설정
+                last_level_index = self.level_combo.findText(f"{last_level:.1f}")
+                if last_level_index >= 0:
+                    self.level_combo.setCurrentIndex(last_level_index)
+                
+                # 현재 난이도와 라벨 업데이트
+                self.current_level = last_level
+                self.level_label.setText(f'현재 난이도: {last_level:.1f}')
+                
+        except Exception as e:
+            print(f"모드 변경 중 오류: {e}")
+        
+    def checkAndDisplayFailedLevels(self):
+        """현재 모드에서 모든 곡을 실패한 난이도들을 확인하고 표시합니다."""
+        try:
+            songs = self.loadSongsData()
+            if songs is None:
+                return
+                
+            mode = self.getSelectedMode()
+            failed_levels = []
             
-            # 콤보박스를 해당 모드의 마지막 난이도로 설정
-            last_level_index = self.level_combo.findText(f"{last_level:.1f}")
-            if last_level_index >= 0:
-                self.level_combo.setCurrentIndex(last_level_index)
+            # 모든 난이도에 대해 확인
+            levels = [1.1, 1.2, 1.3, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3,
+                     4.1, 4.2, 4.3, 5.1, 5.2, 5.3, 6.1, 6.2, 6.3,
+                     7.1, 7.2, 7.3, 8.1, 8.2, 8.3, 9.1, 9.2, 9.3,
+                     10.1, 10.2, 10.3, 11.1, 11.2, 11.3, 12.1, 12.2, 12.3,
+                     13.1, 13.2, 13.3, 14.1, 14.2, 14.3, 15.1, 15.2, 15.3,
+                     16.1, 16.2]
             
-            # 현재 난이도와 라벨 업데이트
-            self.current_level = last_level
-            self.level_label.setText(f'현재 난이도: {last_level:.1f}')
+            for level in levels:
+                level_key = f"{mode}_{level:.1f}"
+                candidate_set = set()
+                
+                # 해당 난이도의 모든 후보 곡 수집
+                attempt_level = self.attempt_stats.get(level_key, {})
+                for song in songs:
+                    if mode in song.get('patterns', {}):
+                        patterns = song['patterns'][mode]
+                        for diff_type, info in patterns.items():
+                            if isinstance(info, dict) and 'floor' in info:
+                                if abs(info['floor'] - level) < 0.01:
+                                    song_key = f"{song['name']}_{mode}_{diff_type}"
+                                    stats = attempt_level.get(song_key, {})
+                                    if not stats.get('cleared', False):
+                                        candidate_set.add((song['name'], diff_type))
+                
+                # 해당 난이도의 실패한 곡들
+                failed_set = self.failed_songs.get(level_key, set())
+                
+                # 모든 후보 곡을 실패했으면 실패한 난이도로 표시
+                if candidate_set and candidate_set.issubset(failed_set):
+                    failed_levels.append(f"{level:.1f}")
             
-            # 설정 저장
-            self.saveLastSettings()
+            # 실패한 난이도 표시 업데이트
+            if failed_levels:
+                self.failed_levels_label.setText(f"⚠️ 모든 곡 실패한 난이도: {', '.join(failed_levels)}")
+            else:
+                self.failed_levels_label.setText("")
+                
+        except Exception as e:
+            print(f"실패한 난이도 확인 중 오류: {e}")
         
     def loadClearedSongs(self):
+        """구버전 호환용: 기존 cleared_songs.json을 로드합니다. (마이그레이션 후에는 비워짐)"""
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             cleared_path = os.path.join(script_dir, 'cleared_songs.json')
@@ -237,6 +317,55 @@ class DifficultyWindow(QMainWindow):
             return {}
         except Exception:
             return {}
+    
+    def migrateClearedToAttemptStats(self):
+        """구버전 cleared_songs.json 내용을 attempt_stats로 옮기고 cleared_songs를 비웁니다."""
+        try:
+            if not self.cleared_songs:
+                return
+            
+            # cleared_songs의 key는 f\"{song_name}_{mode}_{pattern}\" 형식
+            for song_key in list(self.cleared_songs.keys()):
+                try:
+                    # song_key에서 모드와 패턴을 분리
+                    parts = song_key.rsplit('_', 2)
+                    if len(parts) != 3:
+                        continue
+                    song_name, mode, pattern = parts
+                    
+                    # songs.json에서 floor(난이도 값)를 찾아 level_key 구성
+                    songs = self.loadSongsData()
+                    if not songs:
+                        continue
+                    level_value = None
+                    for song in songs:
+                        if song.get('name') != song_name:
+                            continue
+                        pats = song.get('patterns', {})
+                        if mode not in pats:
+                            continue
+                        info = pats[mode].get(pattern)
+                        if isinstance(info, dict) and 'floor' in info:
+                            level_value = float(info['floor'])
+                            break
+                    if level_value is None:
+                        continue
+                    
+                    level_key = f"{mode}_{level_value:.1f}"
+                    if level_key not in self.attempt_stats:
+                        self.attempt_stats[level_key] = {}
+                    if song_key not in self.attempt_stats[level_key]:
+                        self.attempt_stats[level_key][song_key] = {'success': 0, 'fail': 0}
+                    # cleared 플래그 추가 (불리언으로 저장)
+                    self.attempt_stats[level_key][song_key]['cleared'] = True
+                except Exception:
+                    continue
+            
+            # 저장 및 기존 cleared_songs 정리
+            self.saveAttemptStats()
+            self.cleared_songs = {}
+        except Exception as e:
+            print(f"클리어 정보 마이그레이션 중 오류: {e}")
             
     def loadShownSongs(self):
         """표시된 곡 진행상황을 로드합니다."""
@@ -288,23 +417,23 @@ class DifficultyWindow(QMainWindow):
             current_mode = self.getSelectedMode()
             # 현재 모드의 난이도를 업데이트
             self.last_settings['last_mode'] = current_mode
-            self.last_settings[current_mode] = self.current_level
+            
+            # current_level이 설정되어 있을 때만 난이도 저장
+            if hasattr(self, 'current_level') and self.current_level is not None:
+                self.last_settings[current_mode] = self.current_level
+            
             
             script_dir = os.path.dirname(os.path.abspath(__file__))
             settings_path = os.path.join(script_dir, 'last_settings.json')
             with open(settings_path, 'w', encoding='utf-8') as f:
                 json.dump(self.last_settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"설정 저장 중 오류 발생: {e}")
+            # 오류를 조용히 처리 (사용자에게 메시지 박스로 표시하지 않음)
+            pass
             
     def saveClearedSongs(self):
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            cleared_path = os.path.join(script_dir, 'cleared_songs.json')
-            with open(cleared_path, 'w', encoding='utf-8') as f:
-                json.dump(self.cleared_songs, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"클리어한 곡 저장 중 오류 발생: {e}")
+        """구버전 호환용: 더 이상 사용하지 않음 (빈 함수)."""
+        pass
             
     def saveShownSongs(self):
         """표시된 곡 진행상황을 저장합니다."""
@@ -324,17 +453,191 @@ class DifficultyWindow(QMainWindow):
 
         except Exception as e:
             print(f"표시된 곡 저장 중 오류 발생: {e}")
+
+    def loadResultStats(self):
+        """난이도별 성공/실패 통계를 로드합니다."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            stats_path = os.path.join(script_dir, 'result_stats.json')
+            if os.path.exists(stats_path):
+                with open(stats_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            print(f"성공/실패 통계 로드 중 오류: {e}")
+            return {}
+
+    def saveResultStats(self):
+        """난이도별 성공/실패 통계를 저장합니다."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            stats_path = os.path.join(script_dir, 'result_stats.json')
+            with open(stats_path, 'w', encoding='utf-8') as f:
+                json.dump(self.result_stats, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"성공/실패 통계 저장 중 오류: {e}")
+
+    def loadAttemptStats(self):
+        """곡+패턴별 시도 통계를 로드합니다. (UI에는 직접 표기하지 않음)"""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            stats_path = os.path.join(script_dir, 'attempt_stats.json')
+            if os.path.exists(stats_path):
+                with open(stats_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            print(f"시도 통계 로드 중 오류: {e}")
+            return {}
+
+    def saveAttemptStats(self):
+        """곡+패턴별 시도 통계를 저장합니다."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            stats_path = os.path.join(script_dir, 'attempt_stats.json')
+            with open(stats_path, 'w', encoding='utf-8') as f:
+                json.dump(self.attempt_stats, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"시도 통계 저장 중 오류: {e}")
+
+    def _incrementResult(self, level_key, kind):
+        """현재 난이도 레벨키에 대해 성공/실패 카운트를 증가시킵니다."""
+        if level_key not in self.result_stats:
+            self.result_stats[level_key] = {'success': 0, 'fail': 0}
+        if kind == 'success':
+            self.result_stats[level_key]['success'] += 1
+        elif kind == 'fail':
+            self.result_stats[level_key]['fail'] += 1
+        self.saveResultStats()
+
+    def _incrementAttempt(self, mode, level_value, song_name, pattern, kind):
+        """곡+패턴별 시도 통계를 증가시킵니다.
+        구조: attempt_stats[level_key][song_key] = { 'success': n, 'fail': n }
+        level_key = f"{mode}_{level:.1f}", song_key = f"{song}_{mode}_{pattern}"
+        """
+        try:
+            level_key = f"{mode}_{level_value:.1f}"
+            song_key = f"{song_name}_{mode}_{pattern}"
+            
+            if level_key not in self.attempt_stats:
+                self.attempt_stats[level_key] = {}
+            
+            if song_key not in self.attempt_stats[level_key]:
+                self.attempt_stats[level_key][song_key] = {'success': 0, 'fail': 0}
+            
+            # success/fail 값은 0 또는 1까지만 올라가도록 제한
+            if kind == 'success':
+                current = int(self.attempt_stats[level_key][song_key].get('success', 0))
+                self.attempt_stats[level_key][song_key]['success'] = 1 if current > 0 else 1
+            elif kind == 'fail':
+                current = int(self.attempt_stats[level_key][song_key].get('fail', 0))
+                self.attempt_stats[level_key][song_key]['fail'] = 1 if current > 0 else 1
+            self.saveAttemptStats()
+        except Exception:
+            pass
+    
+    def _removeDuplicateSongs(self, level_key, song_name, mode):
+        """특정 곡의 중복된 항목들을 제거합니다."""
+        try:
+            if level_key not in self.attempt_stats:
+                return
+            
+            # 같은 곡명으로 시작하는 모든 키 찾기
+            keys_to_remove = []
+            for key in self.attempt_stats[level_key].keys():
+                if key.startswith(f"{song_name}_{mode}_"):
+                    keys_to_remove.append(key)
+            
+            # 중복이 있으면 첫 번째 것만 남기고 나머지 제거
+            if len(keys_to_remove) > 1:
+                # 성공이 있으면 성공 우선, 없으면 실패 기록 유지
+                has_success = any(self.attempt_stats[level_key][key].get('success', 0) > 0 for key in keys_to_remove)
+                
+                if has_success:
+                    # 성공이 있으면 성공 기록만 유지 (실패 기록 제거)
+                    final_stats = {'success': 1, 'fail': 0}
+                else:
+                    # 성공이 없으면 실패 기록 합산
+                    total_fail = sum(self.attempt_stats[level_key][key].get('fail', 0) for key in keys_to_remove)
+                    final_stats = {'success': 0, 'fail': min(total_fail, 1)}  # 최대 1로 제한
+                
+                # 첫 번째 키에 최종 통계 저장
+                first_key = keys_to_remove[0]
+                self.attempt_stats[level_key][first_key] = final_stats
+                
+                # 나머지 키들 제거
+                for key in keys_to_remove[1:]:
+                    del self.attempt_stats[level_key][key]
+                
+                print(f"중복 제거: {level_key} - {song_name} ({len(keys_to_remove)-1}개 중복 제거)")
+                
+        except Exception as e:
+            print(f"중복 제거 중 오류: {e}")
+    
+    def cleanExistingDuplicates(self):
+        """프로그램 시작 시 기존 중복 데이터를 정리합니다."""
+        try:
+            cleaned_count = 0
+            for level_key, songs in self.attempt_stats.items():
+                # 곡명별로 그룹화
+                song_groups = {}
+                for song_key, stats in songs.items():
+                    # 곡명 추출 (첫 번째 _ 이전 부분)
+                    song_name = song_key.split('_')[0]
+                    if song_name not in song_groups:
+                        song_groups[song_name] = []
+                    song_groups[song_name].append((song_key, stats))
+                
+                # 중복이 있는 곡들 정리
+                for song_name, song_list in song_groups.items():
+                    if len(song_list) > 1:
+                        # 성공이 있으면 성공 우선, 없으면 실패 기록 유지
+                        has_success = any(stats.get('success', 0) > 0 for _, stats in song_list)
+                        
+                        if has_success:
+                            # 성공이 있으면 성공 기록만 유지 (실패 기록 제거)
+                            final_stats = {'success': 1, 'fail': 0}
+                            print(f"중복 정리: {level_key} - {song_name} (성공 기록 우선, 실패 기록 제거)")
+                        else:
+                            # 성공이 없으면 실패 기록 합산
+                            total_fail = sum(stats.get('fail', 0) for _, stats in song_list)
+                            final_stats = {'success': 0, 'fail': min(total_fail, 1)}  # 최대 1로 제한
+                            print(f"중복 정리: {level_key} - {song_name} (실패 기록 합산: {total_fail}회)")
+                        
+                        # 첫 번째 항목에 최종 통계 저장
+                        first_key, _ = song_list[0]
+                        self.attempt_stats[level_key][first_key] = final_stats
+                        
+                        # 나머지 중복 항목들 제거
+                        for key, stats in song_list[1:]:
+                            del self.attempt_stats[level_key][key]
+                            cleaned_count += 1
+                        
+                        print(f"중복 정리: {level_key} - {song_name} ({len(song_list)-1}개 제거)")
+            
+            if cleaned_count > 0:
+                self.saveAttemptStats()
+                print(f"총 {cleaned_count}개의 중복 항목이 정리되었습니다.")
+                
+        except Exception as e:
+            print(f"중복 정리 중 오류: {e}")
             
     def onClearCheck(self, state):
         if self.current_song and self.current_pattern:
             mode = self.getSelectedMode()
             song_key = f"{self.current_song}_{mode}_{self.current_pattern}"
+            # 현재 난이도 키 계산
+            level_key = f"{mode}_{self.current_level:.1f}"
+            if level_key not in self.attempt_stats:
+                self.attempt_stats[level_key] = {}
+            if song_key not in self.attempt_stats[level_key]:
+                self.attempt_stats[level_key][song_key] = {'success': 0, 'fail': 0}
             if state == Qt.Checked:
-                self.cleared_songs[song_key] = True
+                self.attempt_stats[level_key][song_key]['cleared'] = True
             else:
-                if song_key in self.cleared_songs:
-                    del self.cleared_songs[song_key]
-            self.saveClearedSongs()
+                # 체크 해제 시 cleared 플래그 제거
+                self.attempt_stats[level_key][song_key].pop('cleared', None)
+            self.saveAttemptStats()
 
     def onResetClears(self):
         reply = QMessageBox.question(self, '클리어 초기화', 
@@ -343,11 +646,13 @@ class DifficultyWindow(QMainWindow):
                                    QMessageBox.No)
         
         if reply == QMessageBox.Yes:
-            self.cleared_songs = {}
-            self.saveClearedSongs()
+            # attempt_stats에서 cleared 플래그 제거
+            for level_key, songs in self.attempt_stats.items():
+                for song_key, stats in songs.items():
+                    if 'cleared' in stats:
+                        stats.pop('cleared', None)
+            self.saveAttemptStats()
             if self.current_song and self.current_pattern:
-                mode = self.getSelectedMode()
-                song_key = f"{self.current_song}_{mode}_{self.current_pattern}"
                 self.clear_checkbox.setChecked(False)
             QMessageBox.information(self, '초기화 완료', 
                                   '모든 클리어 기록이 초기화되었습니다.')
@@ -385,26 +690,102 @@ class DifficultyWindow(QMainWindow):
         self.current_level = float(self.level_combo.currentText())
         # 화면 업데이트 (저장된 진행도 유지)
         self.updateDisplay()
+        self.checkAndDisplayFailedLevels()  # 실패한 난이도 표시 업데이트
         self.success_btn.setEnabled(True)
         self.fail_btn.setEnabled(True)
         self.saveLastSettings()  # 시작할 때 현재 설정 저장
         
-    def onResetProgress(self):
-        """진행도를 초기화합니다."""
-        reply = QMessageBox.question(self, '진행도 초기화', 
-                                   '모든 진행도를 초기화하시겠습니까?',
+    def onResetCurrentLevel(self):
+        """현재 난이도의 진행도를 초기화합니다."""
+        current_mode = self.getSelectedMode()
+        reply = QMessageBox.question(self, '현재 난이도 초기화', 
+                                   f'{current_mode} 모드 {self.current_level:.1f} 난이도의\n진행도를 초기화하시겠습니까?',
                                    QMessageBox.Yes | QMessageBox.No, 
                                    QMessageBox.No)
         
         if reply == QMessageBox.Yes:
-            self.shown_songs = {}  # 모든 난이도의 진행도 초기화
-            self.saveShownSongs()  # 초기화된 진행도 저장
+            level_key = f"{current_mode}_{self.current_level:.1f}"
+            
+            # 현재 난이도만 초기화
+            if level_key in self.shown_songs:
+                del self.shown_songs[level_key]
+            if level_key in self.failed_songs:
+                del self.failed_songs[level_key]
+            if level_key in self.result_stats:
+                del self.result_stats[level_key]
+                self.saveResultStats()
+            if level_key in self.attempt_stats:
+                del self.attempt_stats[level_key]
+                self.saveAttemptStats()
+            
+            self.saveShownSongs()
             self.updateDisplay()
+            self.checkAndDisplayFailedLevels()  # 실패한 난이도 표시 업데이트
             QMessageBox.information(self, '초기화 완료', 
-                                  '모든 진행도가 초기화되었습니다.')
+                                  f'{current_mode} 모드 {self.current_level:.1f} 난이도의\n진행도가 초기화되었습니다.')
+            
+    def onResetAllLevels(self):
+        """현재 모드의 모든 난이도 진행도를 초기화합니다."""
+        current_mode = self.getSelectedMode()
+        reply = QMessageBox.question(self, '전체 모드 초기화', 
+                                   f'{current_mode} 모드의 모든 난이도\n진행도를 초기화하시겠습니까?',
+                                   QMessageBox.Yes | QMessageBox.No, 
+                                   QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            # 현재 모드의 모든 진행도 초기화
+            keys_to_remove = []
+            for level_key in self.shown_songs.keys():
+                if level_key.startswith(f"{current_mode}_"):
+                    keys_to_remove.append(level_key)
+            
+            for key in keys_to_remove:
+                del self.shown_songs[key]
+            
+            # 현재 모드의 실패 기록도 초기화
+            failed_keys_to_remove = []
+            for level_key in self.failed_songs.keys():
+                if level_key.startswith(f"{current_mode}_"):
+                    failed_keys_to_remove.append(level_key)
+            
+            for key in failed_keys_to_remove:
+                del self.failed_songs[key]
+
+            # 현재 모드의 성공/실패 통계도 초기화
+            stats_keys_to_remove = []
+            for level_key in list(self.result_stats.keys()):
+                if level_key.startswith(f"{current_mode}_"):
+                    stats_keys_to_remove.append(level_key)
+            for key in stats_keys_to_remove:
+                del self.result_stats[key]
+            self.saveResultStats()
+            # 현재 모드의 시도 통계도 초기화
+            attempt_keys_to_remove = []
+            for level_key in list(self.attempt_stats.keys()):
+                if level_key.startswith(f"{current_mode}_"):
+                    attempt_keys_to_remove.append(level_key)
+            for key in attempt_keys_to_remove:
+                del self.attempt_stats[key]
+            self.saveAttemptStats()
+            
+            self.saveShownSongs()
+            self.updateDisplay()
+            self.checkAndDisplayFailedLevels()  # 실패한 난이도 표시 업데이트
+            QMessageBox.information(self, '초기화 완료', 
+                                  f'{current_mode} 모드의 모든 난이도\n진행도가 초기화되었습니다.')
         
     def getSelectedMode(self):
-        return next(mode for mode, btn in self.mode_buttons.items() if btn.isChecked())
+        try:
+            # mode_buttons가 존재하고 비어있지 않은지 확인
+            if hasattr(self, 'mode_buttons') and self.mode_buttons:
+                for mode, btn in self.mode_buttons.items():
+                    if btn.isChecked():
+                        return mode
+            # 선택된 모드가 없을 경우 기본값 반환
+            return '4B'
+        except Exception as e:
+            print(f"모드 선택 확인 중 오류: {e}")
+            return '4B'
         
     def loadSongsData(self):
         """캐시된 곡 데이터를 반환하거나, 필요한 경우 파일에서 새로 로드합니다."""
@@ -447,6 +828,7 @@ class DifficultyWindow(QMainWindow):
             total_songs = 0
             cleared_count = 0
             level_key = f"{mode}_{self.current_level:.1f}"
+            attempt_level = self.attempt_stats.get(level_key, {})
             
             # 전체 곡 수와 클리어한 곡 수 계산
             for song in songs:
@@ -457,32 +839,61 @@ class DifficultyWindow(QMainWindow):
                             if abs(info['floor'] - self.current_level) < 0.01:
                                 total_songs += 1
                                 song_key = f"{song['name']}_{mode}_{diff_type}"
-                                if song_key in self.cleared_songs:
+                                stats = attempt_level.get(song_key, {})
+                                if stats.get('cleared', False):
                                     cleared_count += 1
                                 else:
-                                    # 클리어하지 않은 곡만 후보에 추가 (level로 표기)
-                                    matching_songs.append((song['name'], f"{diff_type}({info.get('level', '?')})", diff_type, info.get('level', '?')))
+                                    # 클리어하지 않았고 시도 기록도 없는 곡만 후보에 추가 (composer 포함)
+                                    if stats.get('success', 0) > 0 or stats.get('fail', 0) > 0:
+                                        # 이미 시도한 곡은 후보 목록에서만 제외하고, 진행도 분자는 아래 루프에서 계산
+                                        continue
+                                    matching_songs.append((
+                                        song['name'],
+                                        song.get('composer', '?'),
+                                        diff_type,
+                                        info.get('level', '?')
+                                    ))
             
             remaining_songs = total_songs - cleared_count  # 남은 곡 수 계산
             
-            # 진행도 표시 (shown_songs에 기록된 개수)
+            # 진행도 표시 (성공 또는 실패 기록이 있는 곡의 개수)
             played_count = 0
-            if level_key in self.shown_songs:
-                # 실제 played_count 계산
-                real_played_count = len(self.shown_songs[level_key])
-                
-                # 표시용 played_count 계산 (remaining_songs를 초과하지 않도록)
-                played_count = min(real_played_count, remaining_songs)
-            
-            # 진행도 라벨 업데이트
+            if level_key in self.attempt_stats:
+                # attempt_stats에서 성공 또는 실패 기록이 있는 곡 카운트 (cleared는 제외)
+                for song_key, stats in self.attempt_stats[level_key].items():
+                    if stats.get('cleared', False):
+                        continue
+                    if stats.get('success', 0) > 0 or stats.get('fail', 0) > 0:
+                        played_count += 1
+            # played_count는 이미 cleared를 제외한, 실제로 시도한 곡 수이므로 그대로 사용
             self.progress_label.setText(f'진행도: {played_count}/{remaining_songs}')
+            # 성공/실패 라벨 업데이트 (곡+패턴별 고유 집계)
+            unique_success = 0
+            unique_fail = 0
+            try:
+                for song_key, r in attempt_level.items():
+                    s = int(r.get('success', 0))
+                    f = int(r.get('fail', 0))
+                    if s > 0:
+                        unique_success += 1
+                    if f > 0 and s == 0:
+                        # 한 번이라도 성공했으면 실패만 카운트하지 않음 (중복 방지)
+                        unique_fail += 1 if f > 0 and s == 0 else 0
+                    elif f > 0 and s == 0:
+                        unique_fail += 1
+            except Exception:
+                pass
+            self.sf_label.setText(
+                f"<b><span style='color:#2e7d32'>성공: {unique_success}</span></b> / "
+                f"<b><span style='color:#d32f2f'>실패: {unique_fail}</span></b>"
+            )
             
             if matching_songs:
                 # level_key가 없으면 초기화
                 if level_key not in self.shown_songs:
                     self.shown_songs[level_key] = set()
                 
-                # 아직 보지 않은 곡 필터링
+                # 아직 보지 않은 곡 필터링 (cleared 여부는 위에서 제외됨)
                 unplayed_songs = [song for song in matching_songs if (song[0], song[2]) not in self.shown_songs[level_key]]
                 
                 # 모든 곡을 다 봤을 경우
@@ -502,7 +913,8 @@ class DifficultyWindow(QMainWindow):
                 
                 # 클리어 체크박스 상태 업데이트
                 song_key = f"{self.current_song}_{mode}_{self.current_pattern}"
-                self.clear_checkbox.setChecked(song_key in self.cleared_songs)
+                stats = attempt_level.get(song_key, {})
+                self.clear_checkbox.setChecked(bool(stats.get('cleared', False)))
                 self.clear_checkbox.setEnabled(True)
                 
                 # 화면에 선택된 곡 표시 (색상 적용)
@@ -515,8 +927,13 @@ class DifficultyWindow(QMainWindow):
                 diff_type = selected_song[2]
                 color = color_map.get(diff_type, "#000000")
                 level = selected_song[3]
+                name = selected_song[0]
+                composer = selected_song[1]
                 self.song_list.setTextFormat(Qt.RichText)
-                self.song_list.setText(f"⭐ {selected_song[0]} - <span style='color:{color}; font-weight:bold'>{diff_type}({level})</span>")
+                self.song_list.setText(
+                    f"⭐ {name} - {composer}<br/>"
+                    f"<span style='color:{color}; font-weight:bold'>{diff_type}({level})</span>"
+                )
                 
             else:
                 if total_songs > 0:  # 곡이 있지만 모두 클리어한 경우
@@ -526,6 +943,24 @@ class DifficultyWindow(QMainWindow):
                 self.clear_checkbox.setEnabled(False)
                 self.current_song = None
                 self.current_pattern = None
+                # 성공/실패 라벨 업데이트 (곡이 없거나 모두 클리어한 경우에도, 고유 집계)
+                unique_success = 0
+                unique_fail = 0
+                try:
+                    attempt_level = self.attempt_stats.get(level_key, {})
+                    for song_key, r in attempt_level.items():
+                        s = int(r.get('success', 0))
+                        f = int(r.get('fail', 0))
+                        if s > 0:
+                            unique_success += 1
+                        if f > 0 and s == 0:
+                            unique_fail += 1
+                except Exception:
+                    pass
+                self.sf_label.setText(
+                    f"<b><span style='color:#2e7d32'>성공: {unique_success}</span></b> / "
+                    f"<b><span style='color:#d32f2f'>실패: {unique_fail}</span></b>"
+                )
                 
         except Exception as e:
             self.song_list.setText(f'오류 발생: {str(e)}')
@@ -540,20 +975,18 @@ class DifficultyWindow(QMainWindow):
             # 항상 shown_songs에 추가 (중복 가능)
             self.shown_songs[level_key].add((self.current_song, self.current_pattern))
             self.saveShownSongs()  # 진행도 저장
+            # 성공 카운트 증가
+            self._incrementResult(level_key, 'success')
+            # 곡+패턴 시도 카운트 증가
+            self._incrementAttempt(self.getSelectedMode(), self.current_level, self.current_song, self.current_pattern, 'success')
         
-        # 난이도 상승
-        levels = [float(self.level_combo.itemText(i)) for i in range(self.level_combo.count())]
-        next_level = None
-        for level in levels:
-            if level > self.current_level:
-                next_level = level
-                break
-        if next_level is not None:
-            self.current_level = next_level
+        # 난이도 상승 (진행도 꽉 찬 난이도는 건너뜀)
+        self.current_level = self._find_next_level_skipping_full(direction='up', fallback=self.current_level)
         
         # 설정 저장 (난이도 변경 후)
         self.saveLastSettings()
         self.updateDisplay()
+        self.checkAndDisplayFailedLevels()  # 실패한 난이도 표시 업데이트
         
     def onFail(self):
         # 현재 곡이 있으면 항상 진행도에 추가 (중복 체크 없음)
@@ -565,20 +998,80 @@ class DifficultyWindow(QMainWindow):
             # 항상 shown_songs에 추가 (중복 가능)
             self.shown_songs[level_key].add((self.current_song, self.current_pattern))
             self.saveShownSongs()  # 진행도 저장
+            
+            # 실패 기록 추가
+            if level_key not in self.failed_songs:
+                self.failed_songs[level_key] = set()
+            self.failed_songs[level_key].add((self.current_song, self.current_pattern))
+            # 실패 카운트 증가
+            self._incrementResult(level_key, 'fail')
+            # 곡+패턴 시도 카운트 증가
+            self._incrementAttempt(self.getSelectedMode(), self.current_level, self.current_song, self.current_pattern, 'fail')
+            
         
-        # 난이도 하락
-        levels = [float(self.level_combo.itemText(i)) for i in range(self.level_combo.count())]
-        prev_level = None
-        for level in reversed(levels):
-            if level < self.current_level:
-                prev_level = level
-                break
-        if prev_level is not None:
-            self.current_level = prev_level
+        # 난이도 하락 (진행도 꽉 찬 난이도는 건너뜀)
+        self.current_level = self._find_next_level_skipping_full(direction='down', fallback=self.current_level)
         
         # 설정 저장 (난이도 변경 후)
         self.saveLastSettings()
         self.updateDisplay()
+        self.checkAndDisplayFailedLevels()  # 실패한 난이도 표시 업데이트
+
+
+
+    def _is_level_progress_full(self, mode, level_value):
+        """해당 모드/난이도의 진행도가 꽉 찼는지 여부를 반환합니다.
+        - 기준: 아직 클리어하지 않은 후보 곡(이름, 패턴)의 집합이
+                shown_songs[level_key]에 모두 포함되어 있으면 꽉 참.
+        - 후보가 전혀 없을 때(곡이 없거나 모두 클리어됨)도 꽉 찬 것으로 간주합니다.
+        """
+        try:
+            songs = self.loadSongsData()
+            if songs is None:
+                return False
+            level_key = f"{mode}_{level_value:.1f}"
+            attempt_level = self.attempt_stats.get(level_key, {})
+            candidate_set = set()
+            for song in songs:
+                if mode in song.get('patterns', {}):
+                    patterns = song['patterns'][mode]
+                    for diff_type, info in patterns.items():
+                        if isinstance(info, dict) and 'floor' in info:
+                            if abs(info['floor'] - level_value) < 0.01:
+                                song_key = f"{song['name']}_{mode}_{diff_type}"
+                                stats = attempt_level.get(song_key, {})
+                                if not stats.get('cleared', False):
+                                    candidate_set.add((song['name'], diff_type))
+            shown_set = self.shown_songs.get(level_key, set())
+            # 후보가 없거나, 후보가 모두 shown에 포함되면 꽉 참
+            return (not candidate_set) or candidate_set.issubset(shown_set)
+        except Exception:
+            return False
+
+    def _find_next_level_skipping_full(self, direction='up', fallback=None):
+        """위/아래 방향으로 이동하되 진행도 꽉 찬 난이도를 건너뜁니다.
+        - direction: 'up'이면 더 높은 난이도, 'down'이면 더 낮은 난이도.
+        - fallback: 적절한 난이도를 찾지 못했을 때 유지할 값.
+        """
+        try:
+            levels = [float(self.level_combo.itemText(i)) for i in range(self.level_combo.count())]
+            mode = self.getSelectedMode()
+            if direction == 'up':
+                for level in levels:
+                    if level > self.current_level:
+                        if not self._is_level_progress_full(mode, level):
+                            return level
+                # 위로 더 이상 없거나 모두 꽉 찼을 때는 마지막 가능한 값 유지
+                return fallback if fallback is not None else self.current_level
+            else:
+                for level in reversed(levels):
+                    if level < self.current_level:
+                        if not self._is_level_progress_full(mode, level):
+                            return level
+                # 아래로 더 이상 없거나 모두 꽉 찼을 때는 현재 값 유지
+                return fallback if fallback is not None else self.current_level
+        except Exception:
+            return fallback if fallback is not None else self.current_level
     
     def closeEvent(self, event):
         """프로그램 종료 시 현재 설정과 진행상황을 저장합니다."""
